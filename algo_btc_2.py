@@ -1,163 +1,176 @@
 import os
 import time
+import json
 import pandas as pd
 import pandas_ta as ta
 from binance.client import Client
 from datetime import datetime, timedelta
 
-# --- 1. CONFIGURATION ---
-PORTFOLIO_CONFIG = {
-    'BTCUSDT': 30.0,
-    'ETHUSDT': 40.0,
-    'SOLUSDT': 30.0,
-}
+# --- 1. CONFIG & STATE PATHS ---
+CONFIG_FILE = 'blockchain_config.json'
+STATE_FILE = 'blockchain_state.json'
+LOG_DIR = 'logs'
 
-FAST_WINDOW = 50
-SLOW_WINDOW = 200
-RSI_BUY_MAX = 55      
-ADX_MIN_STRENGTH = 20 
-COOLDOWN_MINUTES = 60 
-KILL_SWITCH_THRESHOLD = -5.00 
-SIPHON_THRESHOLD = 5.00  # Only siphon if profit is > $5.00
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
 
-client = Client()
+# --- 2. SYSTEM FUNCTIONS ---
+def hard_reset_wifi():
+    print("🚨 Network failure! Attempting WiFi restart...")
+    os.system('sudo nmcli radio wifi off && sleep 2 && sudo nmcli radio wifi on')
+    time.sleep(15)
 
-# --- 2. INITIALIZE ---
-global_reserve = 0.0
-bot_active = True
-# Added 'starting_allocation' to track what to siphon against
-portfolio = {symbol: {
-                'trench_limit': amt, 
-                'current_allocation': amt, 
-                'starting_allocation': amt, 
-                'has_position': False, 
-                'entry_price': 0, 
-                'coin_balance': 0, 
-                'pnl_history': 0.0, 
-                'status': 'IDLE',
-                'last_sell_time': datetime.min 
-            } for symbol, amt in PORTFOLIO_CONFIG.items()}
+def load_config():
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"❌ Config Load Error: {e}")
+        return None
 
-if not os.path.exists('logs'): os.makedirs('logs')
-log_filename = f"logs/siphon_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+def save_state(portfolio, reserve):
+    state = {'global_reserve': reserve, 'portfolio': portfolio.copy()}
+    for symbol in state['portfolio']:
+        lst = state['portfolio'][symbol]['last_sell_time']
+        # Always save as ISO string for JSON compatibility
+        if isinstance(lst, datetime):
+            state['portfolio'][symbol]['last_sell_time'] = lst.isoformat()
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f, indent=4)
 
-def save_log(data_row):
-    # This remains the same, but now data_row will contain 'wallet_reserve'
-    file_exists = os.path.isfile(log_filename)
-    pd.DataFrame([data_row]).to_csv(
-        log_filename, 
-        mode='a', 
-        index=False, 
-        header=not file_exists
-    )
-# --- 3. PROFIT SIPHON FUNCTION ---
-def handle_profit_siphon(symbol, trade_pnl):
-    global global_reserve
-    data = portfolio[symbol]
-    
-    # Only siphon if it's a win AND above our fee-protection threshold
-    if trade_pnl >= SIPHON_THRESHOLD:
-        global_reserve += trade_pnl
-        # Reset current allocation to the original starting point
-        data['current_allocation'] = data['starting_allocation']
-        return f"💰 SIPHONED ${trade_pnl:.2f}"
-    
-    elif trade_pnl > 0:
-        # It's a profit, but too small to siphon. 
-        # We leave it in 'current_allocation' so the next trade is slightly larger (compounding).
-        data['current_allocation'] += trade_pnl
-        return f"📈 SMALL GAIN ${trade_pnl:.2f} (Compounded)"
-        
-    else:
-        # Loss stays within the trench
-        data['current_allocation'] += trade_pnl
-        return f"📉 LOSS ${abs(trade_pnl):.2f}"
+def load_state(initial_portfolio):
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                stored = json.load(f)
+                port = stored['portfolio']
+                for s in port:
+                    ts = port[s].get('last_sell_time', None)
+                    if isinstance(ts, str):
+                        try:
+                            port[s]['last_sell_time'] = datetime.fromisoformat(ts)
+                        except:
+                            port[s]['last_sell_time'] = datetime.min
+                    else:
+                        port[s]['last_sell_time'] = datetime.min
+                return port, stored.get('global_reserve', 0.0)
+        except Exception as e:
+            print(f"⚠️ State Load Error: {e}")
+    return initial_portfolio, 0.0
+
+# --- 3. INITIALIZATION ---
+client = Client() 
+config = load_config()
+
+raw_portfolio = {symbol: {
+    'current_allocation': amt, 'starting_allocation': amt,
+    'has_position': False, 'entry_price': 0, 'max_price_seen': 0,
+    'coin_balance': 0, 'pnl_history': 0.0, 'status': 'IDLE',
+    'last_sell_time': datetime.min
+} for symbol, amt in config['PORTFOLIO_CONFIG'].items()}
+
+portfolio, global_reserve = load_state(raw_portfolio)
+
+# --- 4. MAIN TRADING ENGINE ---
 try:
-    while bot_active:
-        total_pnl_tracker = 0
-        os.system('cls' if os.name == 'nt' else 'clear')
+    while True:
+        temp_config = load_config()
+        if temp_config: config = temp_config
+        params = config['STRATEGY_PARAMS']
         
-        for symbol in PORTFOLIO_CONFIG.keys():
+        os.system('clear' if os.name != 'nt' else 'cls')
+        print(f"--- 🛡️ SNIPER BOT ACTIVE | {datetime.now().strftime('%H:%M:%S')} ---")
+        print(f"Reserve: ${global_reserve:.2f} | Strategy: Buy the Dip")
+        print("-" * 60)
+
+        for symbol in config['PORTFOLIO_CONFIG'].keys():
             try:
-                # INDICATORS CALCULATED SEPERATELY FOR EACH SYMBOL
-                bars = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=300)
-                df = pd.DataFrame(bars, columns=['T', 'O', 'H', 'L', 'C', 'V', 'CT', 'QA', 'TQ', 'TB', 'TQ2', 'I'])
-                df[['O', 'H', 'L', 'C']] = df[['O', 'H', 'L', 'C']].astype(float)
+                # 1. DATA FETCHING
+                klines = client.get_historical_klines(symbol, Client.KLINE_INTERVAL_15MINUTE, "5 days ago UTC")
+                df = pd.DataFrame(klines, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'cts', 'qv', 'nt', 'tbv', 'tqv', 'i'])
+                for col in ['c', 'h', 'l']: df[col] = pd.to_numeric(df[col])
+
+                # 2. INDICATORS
+                sma_f = ta.sma(df['c'], length=params['fast_sma'])
+                sma_s = ta.sma(df['c'], length=params['slow_sma'])
+                rsi = ta.rsi(df['c'], length=params['rsi_period'])
+                adx_df = ta.adx(df['h'], df['l'], df['c'], length=params['adx_period'])
+                bb = ta.bbands(df['c'], length=params['bb_period'], std=params['bb_std'])
+                atr = ta.atr(df['h'], df['l'], df['c'], length=params['atr_period'])
+
+                if sma_s is None or sma_s.isna().iloc[-1]:
+                    continue
+
+                # Dynamic Bollinger Mapping
+                mid_bb_col = [c for c in bb.columns if c.startswith('BBM_')][0]
                 
-                sma_f = ta.sma(df['C'], length=FAST_WINDOW).iloc[-1]
-                sma_s = ta.sma(df['C'], length=SLOW_WINDOW).iloc[-1]
-                adx_df = ta.adx(df['H'], df['L'], df['C'], length=14)
-                current_adx = adx_df['ADX_14'].iloc[-1]
-                current_rsi = ta.rsi(df['C'], length=14).iloc[-1]
-                atr = ta.atr(df['H'], df['L'], df['C'], length=14).iloc[-1]
-                
-                current_price = df['C'].iloc[-1]
+                curr_price = df['c'].iloc[-1]
+                curr_sma_f = sma_f.iloc[-1]
+                curr_sma_s = sma_s.iloc[-1]
+                curr_rsi = rsi.iloc[-1]
+                curr_adx = adx_df['ADX_14'].iloc[-1]
+                curr_mid_bb = bb[mid_bb_col].iloc[-1]
+                curr_atr = atr.iloc[-1]
+
                 data = portfolio[symbol]
                 event = "NONE"
-                siphon_msg = ""
 
-                in_cooldown = datetime.now() < (data['last_sell_time'] + timedelta(minutes=COOLDOWN_MINUTES))
+                # 3. VOTING
+                v_trend = 1 if curr_sma_f > curr_sma_s else 0
+                v_mom = 1 if (curr_rsi < params['rsi_buy_max'] and curr_adx > params['adx_min_strength']) else 0
+                v_vol = 1 if curr_price < curr_mid_bb else 0
+                total_votes = v_trend + v_mom + v_vol
 
-                # ENTRY LOGIC
-                if (sma_f > sma_s and current_adx > ADX_MIN_STRENGTH and 
-                    current_rsi < RSI_BUY_MAX and not data['has_position'] and not in_cooldown):
+                # 🟢 ENTRY LOGIC
+                if not data['has_position']:
+                    # --- CRITICAL TYPE GUARD ---
+                    last_sell = data['last_sell_time']
+                    if isinstance(last_sell, str):
+                        try:
+                            last_sell = datetime.fromisoformat(last_sell)
+                        except:
+                            last_sell = datetime.min
                     
-                    data['entry_price'] = current_price
-                    # Use current_allocation (which might be lower if a previous loss occurred)
-                    data['coin_balance'] = (data['current_allocation'] * 0.999) / current_price
-                    data['has_position'] = True
-                    data['status'] = 'HOLDING'
-                    event = "BUY"
+                    cooldown_time = last_sell + timedelta(minutes=params['cooldown_minutes'])
+                    in_cooldown = datetime.now() < cooldown_time
+                    
+                    if total_votes >= params['buy_vote_threshold'] and not in_cooldown:
+                        data.update({
+                            'has_position': True, 'entry_price': curr_price,
+                            'max_price_seen': curr_price, 'status': 'HOLDING',
+                            'coin_balance': data['current_allocation'] / curr_price
+                        })
+                        event = "BUY"
 
-                # EXIT LOGIC WITH SIPHONING
+                # 🔴 EXIT LOGIC
                 elif data['has_position']:
-                    stop_price = data['entry_price'] - (2 * atr)
+                    data['max_price_seen'] = max(data['max_price_seen'], curr_price)
+                    floor = data['max_price_seen'] - (params['atr_multiplier'] * curr_atr)
+                    open_pnl = (curr_price - data['entry_price']) * data['coin_balance']
                     
-                    if current_price < stop_price or sma_f < sma_s:
-                        sell_val = (data['coin_balance'] * current_price) * 0.999
-                        trade_pnl = sell_val - data['current_allocation']
+                    if (curr_price < floor) or (curr_sma_f < curr_sma_s):
+                        trade_pnl = open_pnl * 0.999
+                        if trade_pnl >= params['siphon_threshold']:
+                            global_reserve += trade_pnl
+                            data['current_allocation'] = data['starting_allocation']
+                        else:
+                            data['current_allocation'] += trade_pnl
                         
-                        # Trigger the Siphon
-                        s_msg = handle_profit_siphon(symbol, trade_pnl)
-                        
-                        data['pnl_history'] += trade_pnl
-                        data['has_position'] = False
-                        data['status'] = 'IDLE'
-                        data['last_sell_time'] = datetime.now()
-                        event = f"SELL ({s_msg})"
+                        data.update({
+                            'pnl_history': data['pnl_history'] + trade_pnl,
+                            'has_position': False, 'status': 'IDLE',
+                            'last_sell_time': datetime.now()
+                        })
+                        event = f"SELL"
 
-                # LOGGING
-                open_pnl = (current_price - data['entry_price']) * data['coin_balance'] if data['has_position'] else 0
-                symbol_total_pnl = data['pnl_history'] + open_pnl
-                total_pnl_tracker += symbol_total_pnl
-
-                save_log({
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'symbol': symbol, 
-                        'price': current_price, 
-                        'rsi': current_rsi,
-                        'status': data['status'], 
-                        'event': event, 
-                        'current_pnl': symbol_total_pnl,
-                        'wallet_reserve': global_reserve  # <-- Add this line
-                    })
+                print(f"[{symbol}] Price: {curr_price:.2f} | Votes: {total_votes}/{params['buy_vote_threshold']}")
 
             except Exception as e:
-                with open("bot_errors.txt", "a") as f:
-                    f.write(f"{datetime.now()} Error {symbol}: {str(e)}\n")
+                print(f"Error {symbol}: {e}")
 
-        # DASHBOARD
-        print(f"💰 WALLET RESERVE: ${global_reserve:.2f} | ACTIVE PnL: ${total_pnl_tracker:.2f}")
-        print("-" * 65)
-        for sym, d in portfolio.items():
-            cd = "❄️" if datetime.now() < (d['last_sell_time'] + timedelta(minutes=COOLDOWN_MINUTES)) else "  "
-            print(f"{sym:10} {cd} | Cap: ${d['current_allocation']:6.2f} | {d['status']:8} | PnL: ${d['pnl_history']:6.2f}")
-        
-        if total_pnl_tracker <= KILL_SWITCH_THRESHOLD:
-            print(f"\n🛑 KILL-SWITCH TRIGGERED AT ${total_pnl_tracker:.2f}")
-            break
-
-        time.sleep(60)
+        save_state(portfolio, global_reserve)
+        time.sleep(config['LOOP_INTERVAL'])
 
 except KeyboardInterrupt:
-    print("\nManual Stop.")
+    save_state(portfolio, global_reserve)
+    print("\n✅ Session saved. Bot Halted.")

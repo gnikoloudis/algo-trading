@@ -1,0 +1,23 @@
+{
+    "LOOP_INTERVAL": 120,
+    "PORTFOLIO_CONFIG": {
+        "BTCUSDT": 30.0,
+        "ETHUSDT": 40.0,
+        "SOLUSDT": 30.0
+    },
+    "STRATEGY_PARAMS": {
+        "adx_min_strength": 15,
+        "adx_period": 14,
+        "atr_multiplier": 2.0,
+        "atr_period": 14,
+        "bb_period": 20,
+        "bb_std": 2.2,
+        "buy_vote_threshold": 2,
+        "cooldown_minutes": 45,
+        "fast_sma": 20,
+        "rsi_buy_max": 55,
+        "rsi_period": 14,
+        "siphon_threshold": 1.0,
+        "slow_sma": 100
+    }
+}
