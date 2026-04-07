@@ -15,11 +15,6 @@ if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
 # --- 2. SYSTEM FUNCTIONS ---
-def hard_reset_wifi():
-    print("🚨 Network failure! Attempting WiFi restart...")
-    os.system('sudo nmcli radio wifi off && sleep 2 && sudo nmcli radio wifi on')
-    time.sleep(15)
-
 def load_config():
     try:
         with open(CONFIG_FILE, 'r') as f:
@@ -32,7 +27,6 @@ def save_state(portfolio, reserve):
     state = {'global_reserve': reserve, 'portfolio': portfolio.copy()}
     for symbol in state['portfolio']:
         lst = state['portfolio'][symbol]['last_sell_time']
-        # Always save as ISO string for JSON compatibility
         if isinstance(lst, datetime):
             state['portfolio'][symbol]['last_sell_time'] = lst.isoformat()
     with open(STATE_FILE, 'w') as f:
@@ -58,6 +52,12 @@ def load_state(initial_portfolio):
             print(f"⚠️ State Load Error: {e}")
     return initial_portfolio, 0.0
 
+def save_log(log_data):
+    """Writes a row to CSV for detailed performance study"""
+    filename = os.path.join(LOG_DIR, f"blockchain_sim_performance_{datetime.now().strftime('%Y%m%d')}.csv")
+    file_exists = os.path.isfile(filename)
+    pd.DataFrame([log_data]).to_csv(filename, mode='a', index=False, header=not file_exists)
+
 # --- 3. INITIALIZATION ---
 client = Client() 
 config = load_config()
@@ -80,7 +80,7 @@ try:
         
         os.system('clear' if os.name != 'nt' else 'cls')
         print(f"--- 🛡️ SNIPER BOT ACTIVE | {datetime.now().strftime('%H:%M:%S')} ---")
-        print(f"Reserve: ${global_reserve:.2f} | Strategy: Buy the Dip")
+        print(f"Global Reserve: ${global_reserve:.2f}")
         print("-" * 60)
 
         for symbol in config['PORTFOLIO_CONFIG'].keys():
@@ -101,7 +101,6 @@ try:
                 if sma_s is None or sma_s.isna().iloc[-1]:
                     continue
 
-                # Dynamic Bollinger Mapping
                 mid_bb_col = [c for c in bb.columns if c.startswith('BBM_')][0]
                 
                 curr_price = df['c'].iloc[-1]
@@ -114,6 +113,8 @@ try:
 
                 data = portfolio[symbol]
                 event = "NONE"
+                open_pnl = 0
+                floor = 0
 
                 # 3. VOTING
                 v_trend = 1 if curr_sma_f > curr_sma_s else 0
@@ -123,16 +124,10 @@ try:
 
                 # 🟢 ENTRY LOGIC
                 if not data['has_position']:
-                    # --- CRITICAL TYPE GUARD ---
-                    last_sell = data['last_sell_time']
-                    if isinstance(last_sell, str):
-                        try:
-                            last_sell = datetime.fromisoformat(last_sell)
-                        except:
-                            last_sell = datetime.min
+                    lst = data['last_sell_time']
+                    if isinstance(lst, str): lst = datetime.fromisoformat(lst)
                     
-                    cooldown_time = last_sell + timedelta(minutes=params['cooldown_minutes'])
-                    in_cooldown = datetime.now() < cooldown_time
+                    in_cooldown = datetime.now() < (lst + timedelta(minutes=params['cooldown_minutes']))
                     
                     if total_votes >= params['buy_vote_threshold'] and not in_cooldown:
                         data.update({
@@ -150,6 +145,8 @@ try:
                     
                     if (curr_price < floor) or (curr_sma_f < curr_sma_s):
                         trade_pnl = open_pnl * 0.999
+                        reason = "ATR_STOP" if curr_price < floor else "TREND_FLIP"
+                        
                         if trade_pnl >= params['siphon_threshold']:
                             global_reserve += trade_pnl
                             data['current_allocation'] = data['starting_allocation']
@@ -161,9 +158,27 @@ try:
                             'has_position': False, 'status': 'IDLE',
                             'last_sell_time': datetime.now()
                         })
-                        event = f"SELL"
+                        event = f"SELL ({reason})"
+                        open_pnl = 0
 
-                print(f"[{symbol}] Price: {curr_price:.2f} | Votes: {total_votes}/{params['buy_vote_threshold']}")
+                # 4. LOGGING & DISPLAY
+                print(f"[{symbol}] Price: {curr_price:.2f} | Votes: {total_votes}/{params['buy_vote_threshold']} | {data['status']}")
+                
+                save_log({
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'symbol': symbol,
+                    'price': curr_price,
+                    'status': data['status'],
+                    'event': event,
+                    'rsi': round(curr_rsi, 2),
+                    'adx': round(curr_adx, 2),
+                    'sma_f': round(curr_sma_f, 2),
+                    'sma_s': round(curr_sma_s, 2),
+                    'votes': total_votes,
+                    'open_pnl': round(open_pnl, 2),
+                    'cum_pnl': round(data['pnl_history'], 2),
+                    'reserve': round(global_reserve, 2)
+                })
 
             except Exception as e:
                 print(f"Error {symbol}: {e}")
